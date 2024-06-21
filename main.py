@@ -1,112 +1,85 @@
-import pdfplumber
-import fitz
 import os
-import io
+import fitz  # PyMuPDF
 from PIL import Image
-import re
+import io
+import logging
 
-PDF_PATH = "./docs/Knox Meeting_user_manual.pdf"
-OUTPUT_IMAGES_DIR = "images"
+# 설정
+DOCS_DIR = './docs'
+IMAGES_DIR = './images'
 
-def sanitize_text(text):
-    """Sanitize and truncate text for use in filenames."""
-    if not text:
-        return "unknown"
-    text = re.sub(r'[\\/*?:"<>|]', "", text)
-    text = ''.join([c for c in text if c.isprintable() and not c.isspace()])
-    return text[:50]
+# 디렉토리 생성
+os.makedirs(IMAGES_DIR, exist_ok=True)
 
-def resize_image(image):
-    """Resize the image to a maximum size of 70% of the larger dimension."""
-    max_size = int(max(image.width, image.height) * 0.7)
-    if image.width > max_size or image.height > max_size:
-        if image.width > image.height:
-            aspect_ratio = image.height / image.width
-            new_width = max_size
-            new_height = int(max_size * aspect_ratio)
-        else:
-            aspect_ratio = image.width / image.height
-            new_height = max_size
-            new_width = int(max_size * aspect_ratio)
-        image = image.resize((new_width, new_height), Image.BICUBIC)
-    return image
+# 시작 시 images 디렉토리의 모든 파일 삭제
+for f in os.listdir(IMAGES_DIR):
+    file_path = os.path.join(IMAGES_DIR, f)
+    if os.path.isfile(file_path):
+        os.remove(file_path)
 
-def generate_unique_filename(directory, base_filename, extension):
-    """Generate a unique filename if a file already exists."""
-    counter = 1
-    unique_filename = f"{base_filename}{extension}"
-    while os.path.exists(os.path.join(directory, unique_filename)):
-        unique_filename = f"{base_filename}({counter}){extension}"
-        counter += 1
-    return unique_filename
+# 로깅 설정
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def save_images_from_page(document, page_number, headings):
-    """Extract and save images from a specific page of the PDF document."""
-    saved_images = []
-    pagina = document.load_page(page_number)
-    imagens = pagina.get_images(full=True)
-    heading_str = '-'.join(headings)
-    img_index = 1
+# PDF 파일 목록 확인
+pdf_files = [f for f in os.listdir(DOCS_DIR) if f.lower().endswith('.pdf')]
+if not pdf_files:
+    logging.error('PDF 파일이 docs 디렉토리에 없습니다.')
+    exit(1)
 
-    for img in imagens:
-        try:
+# 이미지 추출 및 저장 함수
+def save_images_from_pdf(pdf_path, doc_name):
+    document = fitz.open(pdf_path)
+    image_count = 0
+
+    for page_num in range(len(document)):
+        page = document.load_page(page_num)
+        images = page.get_images(full=True)
+        
+        # 이미지 정보를 y좌표를 기준으로 정렬
+        image_infos = []
+        for img in images:
             xref = img[0]
             base_image = document.extract_image(xref)
             image_bytes = base_image["image"]
+            bbox = page.get_image_bbox(img)
+            y_coord = bbox.y0  # 이미지의 상단 y좌표
+            image_infos.append((xref, image_bytes, y_coord))
+        
+        image_infos.sort(key=lambda x: x[2])  # y좌표 기준으로 정렬
+
+        line_num = 1
+        image_index = 1
+
+        for xref, image_bytes, y_coord in image_infos:
             image = Image.open(io.BytesIO(image_bytes))
-            if image.width < 500 or image.height < 500:
-                continue
-            image = resize_image(image)
-            base_filename = f"{page_number + 1}_{heading_str}_{img_index:04}"
-            extension = ".webp"
-            os.makedirs(OUTPUT_IMAGES_DIR, exist_ok=True)
-            image_filename = generate_unique_filename(OUTPUT_IMAGES_DIR, base_filename, extension)
-            full_image_path = os.path.join(OUTPUT_IMAGES_DIR, image_filename)
-            image.save(full_image_path, "WEBP", quality=85)
-            saved_images.append(full_image_path)
-            img_index += 1
-        except Exception as e:
-            print(f"Error saving image on page {page_number + 1}: {e}")
 
-    return saved_images
+            # 이미지 직전의 텍스트 라인 번호 계산
+            text_instances = page.search_for(" ")  # 모든 텍스트 위치 검색
+            previous_line_num = 0
+            for inst in text_instances:
+                if inst[3] <= y_coord:  # 텍스트의 하단 y좌표가 이미지의 y좌표보다 작거나 같을 때
+                    previous_line_num = max(previous_line_num, int(inst[1] // 12) + 1)  # 12는 대략적인 라인 높이, 필요 시 조정
 
-def extract_headings_from_text(text):
-    """Extract all levels of headings from text, skipping possible page numbers."""
-    text = re.sub(r'^\s*\d+\s*$', '', text, flags=re.MULTILINE)
-    headings = re.findall(r'\d+(?:\.\d+)*', text)
-    return headings if headings else ["0"]
+            line_num = previous_line_num + 1
 
-def process_pdf(pdf_path):
-    """Process the PDF to extract text and images."""
-    document = fitz.open(pdf_path)
-    print("[document]: ", document)
-    
-    with pdfplumber.open(pdf_path) as pdf:
-        pages = pdf.pages
-        total_images = 0
-        previous_heading_str = ""
-        
-        for index, pagina in enumerate(pages):
-            texto = pagina.extract_text() or ""
-            print(f"Text on Page {index + 1}:")
-            headings = extract_headings_from_text(texto)
-            heading_str = '-'.join(headings)
+            file_name = f"{doc_name}_{page_num+1}_{image_index}_{line_num}.webp"
+            file_path = os.path.join(IMAGES_DIR, file_name)
 
-            if heading_str != previous_heading_str:
-                img_index = 1
-                previous_heading_str = heading_str
+            if os.path.exists(file_path):
+                logging.info(f"덮어쓰기: {file_path}")
 
-            imagens = save_images_from_page(document, index, headings)
-            print(f"Images Extracted from Page {index + 1}: {len(imagens)} heading:{headings}")
-            total_images += len(imagens)
-            for img in imagens:
-                print(f"Image Saved: {img}")
-            print("=" * 50)
-        
-        print(f"Total Images Extracted: {total_images}")
-        print("Extraction Done!")
-    
-    document.close()
+            image.save(file_path, "WEBP")
+            print("Image saved: ", file_name)
+            image_index += 1
+            image_count += 1
 
-if __name__ == "__main__":
-    process_pdf(PDF_PATH)
+    return image_count
+
+# 각 PDF 파일에서 이미지 추출
+for pdf_file in pdf_files:
+    doc_name = pdf_file[:4]
+    pdf_path = os.path.join(DOCS_DIR, pdf_file)
+    extracted_image_count = save_images_from_pdf(pdf_path, doc_name)
+    logging.info(f"{pdf_file}에서 {extracted_image_count}개의 이미지를 추출했습니다. 저장 위치: {IMAGES_DIR}")
+
+logging.info("프로그램이 종료되었습니다.")
